@@ -76,7 +76,20 @@ with lib;
 
       enableConfigReplace = mkEnableOption "vm_config.json replace (WARNING ALPHA MAY BRICK INSTALL)";
       useGenericKernel = mkEnableOption "use latest standard kernel";
-      enableGraphics = mkEnableOption "graphics support (Weston + gfxstream)" // { default = true; };
+      enableGraphics = mkEnableOption "graphics support (Weston + gfxstream)" // {
+        default = true;
+      };
+      ttydExtraArgs = mkOption {
+        description = "Extra arguments to pass to ttyd before -W";
+        type = types.listOf types.str;
+        default = [ ];
+        example = [
+          "-t"
+          "fontSize=14"
+          "-t"
+          "fontFamily=monospace"
+        ];
+      };
     };
   };
 
@@ -146,7 +159,27 @@ with lib;
 
     systemd.services.ttyd = {
       serviceConfig = {
-        ExecStart = "${extraPkgs.ttyd}/bin/ttyd --ssl --ssl-cert /etc/ttyd/server.crt --ssl-key /etc/ttyd/server.key --ssl-ca /mnt/internal/ca.crt -t disableLeaveAlert=true -W ${config.services.ttyd.entrypoint} -f ${cfg.defaultUser}";
+        ExecStart = lib.escapeShellArgs (
+          [
+            "${lib.getExe extraPkgs.ttyd}"
+            "--ssl"
+            "--ssl-cert"
+            "/etc/ttyd/server.crt"
+            "--ssl-key"
+            "/etc/ttyd/server.key"
+            "--ssl-ca"
+            "/mnt/internal/ca.crt"
+            "-t"
+            "disableLeaveAlert=true"
+          ]
+          ++ cfg.ttydExtraArgs
+          ++ [
+            "-W"
+            "${config.services.ttyd.entrypoint}"
+            "-f"
+            cfg.defaultUser
+          ]
+        );
         Type = "simple";
         Restart = "always";
         User = "root";
@@ -265,13 +298,20 @@ with lib;
           else
             "extraStructuredConfig"
         } =
-          with lib.kernel; {
+          with lib.kernel;
+          {
             CPU_FREQ = yes;
             IKCONFIG = yes;
             IKCONFIG_PROC = yes;
-          } // (if pkgs.stdenv.targetPlatform.isAarch64 then {
-            ANDROID_V_CPUFREQ_VIRT = yes;
-          } else {});
+          }
+          // (
+            if pkgs.stdenv.targetPlatform.isAarch64 then
+              {
+                ANDROID_V_CPUFREQ_VIRT = yes;
+              }
+            else
+              { }
+          );
       }
     ];
 
@@ -345,7 +385,12 @@ with lib;
       extraGroups = [
         "${cfg.defaultUser}"
         "wheel"
-      ] ++ lib.optionals cfg.enableGraphics [ "video" "render" "seat" ];
+      ]
+      ++ lib.optionals cfg.enableGraphics [
+        "video"
+        "render"
+        "seat"
+      ];
       initialHashedPassword = "";
     };
     users.groups.${cfg.defaultUser} = { };
@@ -360,11 +405,14 @@ with lib;
       '';
     */
 
-    environment.systemPackages = mkIf cfg.enableGraphics (with pkgs; [
-      mesa
-      weston
-      libdrm
-    ]);
+    environment.systemPackages = mkIf cfg.enableGraphics (
+      with pkgs;
+      [
+        mesa
+        weston
+        libdrm
+      ]
+    );
 
     # Enable hardware acceleration
     hardware.graphics.enable = mkIf cfg.enableGraphics true;
