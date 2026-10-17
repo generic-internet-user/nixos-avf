@@ -8,15 +8,8 @@
   dosfstools,
   lib,
   extraFiles,
+  payloadFiles,
 }:
-
-let
-  RELEASE_YEAR = "2025";
-  # switch back to lib.concatMapAttrsStringSep once 24.11 is dropped
-  concatMapAttrsStringSep =
-    sep: f: attrs:
-    lib.concatStringsSep sep (lib.mapAttrsToList f attrs);
-in
 stdenv.mkDerivation {
   name = "avf_image.tar.gz";
 
@@ -34,7 +27,9 @@ stdenv.mkDerivation {
 
     OFFSETS=($(sfdisk -l $diskImage -o Start,Sectors | tail -n 2 | grep -o "[0-9]*"))
 
-    echo "nixos_avf/${lib.replaceStrings [ "-" ] [ "_" ] stdenv.targetPlatform.system}/${lib.trivial.version}-0-$(date)" > build_id
+    echo "nixos_avf/${
+      lib.replaceStrings [ "-" ] [ "_" ] stdenv.targetPlatform.system
+    }/${lib.trivial.version}-0-$(date)" > build_id
 
     # bs=512 -> sector size is 512, skip=start sector, count=size in sectors
     dd if=$diskImage of=efi_part bs=512 skip="''${OFFSETS[0]}" count="''${OFFSETS[1]}"
@@ -55,10 +50,20 @@ stdenv.mkDerivation {
     efi_part
     vm_config.json
     )
-    ${concatMapAttrsStringSep "\n" (key: value: ''
-      cp ${lib.escapeShellArg "${value}"} ${lib.escapeShellArg key}
-      contents+=(${lib.escapeShellArg key})
-    '') extraFiles}
+
+    # payloadFiles are files vm_config.json refers to by name. Under Android 17
+    # that is the kernel and initrd: the app hands both straight to crosvm and
+    # never looks at the ESP, so the copies the installed bootloader made in
+    # efi_part are never read.
+    ${lib.concatMapStrings (f: ''
+      cp ${lib.escapeShellArg f.src} ${lib.escapeShellArg f.name}
+      contents+=(${lib.escapeShellArg f.name})
+    '') payloadFiles}
+
+    ${lib.concatMapStrings (name: ''
+      cp ${lib.escapeShellArg "${extraFiles.${name}}"} ${lib.escapeShellArg name}
+      contents+=(${lib.escapeShellArg name})
+    '') (lib.attrNames extraFiles)}
 
     # --sparse option isn't supported in apache-commons-compress
     tar cv -I pigz -f $out -C . "''${contents[@]}"

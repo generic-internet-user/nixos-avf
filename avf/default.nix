@@ -75,9 +75,40 @@ with lib;
       };
 
       enableConfigReplace = mkEnableOption "vm_config.json replace (WARNING ALPHA MAY BRICK INSTALL)";
-      useGenericKernel = mkEnableOption "use latest standard kernel";
+      useGenericKernel = mkEnableOption "use latest standard kernel (see below for the trade-off)";
       enableGraphics = mkEnableOption "graphics support (Weston + gfxstream)" // {
         default = true;
+      };
+      directBoot = mkOption {
+        type = types.bool;
+        default = true;
+        description = ''
+          Hand the kernel and initrd straight to crosvm via `vm_config.json`,
+          the way Android 17's Terminal app does for its own images.
+
+          Up to Android 16 the Terminal app chainloaded `u-boot` from the host,
+          which then booted the ESP in `efi_part`, so a bootloader had to be
+          installed into the image. Android 17 boots the payload kernel
+          directly and executes `/sbin/init` in the guest, which makes the
+          installed bootloader dead weight.
+
+          Turning this off restores the Android 16 behaviour (u-boot
+          chainload, `/mnt/internal`, the guest daemons that need it) for
+          devices still on an older release.
+        '';
+      };
+      enableAudio = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Ask the host for a virtio-snd device by adding an `audio` block to
+          `vm_config.json`, and load `snd_virtio` in the initrd.
+
+          Untested. The host side is gated on crosvm being built with
+          `paravirtualized_devices`; when it is not, crosvm logs "Audio
+          configuration not supported" and ignores the request. The same flag
+          gates display, which is likewise not known to work.
+        '';
       };
       ttydExtraArgs = mkOption {
         description = "Extra arguments to pass to ttyd before -W";
@@ -136,6 +167,35 @@ with lib;
       gpu = {
         backend = "2d";
       };
+
+      # Direct boot: crosvm is handed the payload's kernel and initrd and
+      # `params` is the whole kernel command line, so everything
+      # `boot.kernelParams` would otherwise have contributed through the
+      # installed bootloader has to be spelled out here. The `init=` half is
+      # what nixos' own systemd-boot builder writes for every entry, and for
+      # a systemd-initrd system `$toplevel/init` is a copy of systemd itself
+      # (see system/activation/top-level.nix). `root=` is deliberately left
+      # alone: systemd defaults to `fstab`, and nixpkgs generates the initrd's
+      # fstab from `fileSystems."/"`, which points at
+      # /dev/disk/by-label/nixos.
+      kernel = mkIf cfg.directBoot "$PAYLOAD_DIR/vmlinuz";
+      initrd = mkIf cfg.directBoot "$PAYLOAD_DIR/initrd.img";
+      params = mkIf cfg.directBoot "init=${config.system.build.toplevel}/init ${toString config.boot.kernelParams}";
+
+      # The app only surfaces the console once this is set, which is the only
+      # window into a failed boot.
+      connect_console = mkIf cfg.directBoot true;
+
+      # The 60s default is short for a first boot of a cold NixOS on a phone.
+      boot_timeout_secs = mkIf cfg.directBoot 180;
+
+      # crosvm serves audio as a vhost-user `sound` device fronted by
+      # crosvm_vu_snd talking to Android's AudioFlinger, and only when the
+      # image asks for one.
+      audio = mkIf cfg.enableAudio {
+        microphone = false;
+        speaker = true;
+      };
     };
 
     /*
@@ -167,8 +227,20 @@ with lib;
             "/etc/ttyd/server.crt"
             "--ssl-key"
             "/etc/ttyd/server.key"
+          ]
+          # The CA is how ttyd verified the Terminal app's client certificate,
+          # and it arrived through /mnt/internal, which Android 17 no longer
+          # exposes. Without it ttyd serves TLS but does not ask for a client
+          # certificate, which is fine: the app's WebView calls
+          # `handler.proceed()` on any SSL error anyway ("ttyd uses
+          # self-signed certificate"). TLS itself has to stay, because the
+          # app decides http-vs-https from `terminalAddress.key.isNullOrEmpty()`
+          # and the mDNS discovery path below never sets a key.
+          ++ lib.optionals (!cfg.directBoot) [
             "--ssl-ca"
             "/mnt/internal/ca.crt"
+          ]
+          ++ [
             "-t"
             "disableLeaveAlert=true"
           ]
@@ -191,12 +263,20 @@ with lib;
       after = [
         "network-online.target"
         "network.target"
-        "mnt-internal.mount"
-      ];
+      ]
+      ++ lib.optionals (!cfg.directBoot) [ "mnt-internal.mount" ];
 
       restartIfChanged = false;
     };
 
+    # How the app finds ttyd. TerminalApp's VmController picks between two
+    # paths: it only looks for a vsock bridge when the image's `build_id`
+    # parses as a number >= 5106 (InstalledImage.BuildInfo), and otherwise
+    # registers an NsdManager query for a service literally named `ttyd` of
+    # type `_http._tcp`, then connects to whatever address it resolves to.
+    # finish.nix writes `nixos_avf/<system>/<version>-0-<date>`, which parses
+    # to build_id 0, so the mDNS path is the one in play. That is the same
+    # discovery the pre-Android-17 Terminal used, which is why avahi stays.
     systemd.services.avahi_ttyd = {
       description = "avahi_TTYD";
 
@@ -240,6 +320,19 @@ with lib;
 
       vm_config = config.system.build.vmConfig;
       extraFiles = cfg.extraFiles;
+
+      # Names here are what `avf.vmConfig` refers to, so the two lists have to
+      # agree; the guest's bootloader is bypassed entirely on Android 17.
+      payloadFiles = lib.optionals cfg.directBoot [
+        {
+          name = "vmlinuz";
+          src = "${config.boot.kernelPackages.kernel}/${config.system.boot.loader.kernelFile}";
+        }
+        {
+          name = "initrd.img";
+          src = "${config.system.build.initialRamdisk}/${config.system.boot.loader.initrdFile}";
+        }
+      ];
     };
 
     system.build.vmConfig = vmConfig.generate "vm_config.json" cfg.vmConfig;
@@ -271,6 +364,18 @@ with lib;
     boot.loader.timeout = 0;
 
     # avf patches only available for 6.1 right now
+    #
+    # Turning these on is what pins the kernel to 6.1 *and* makes it
+    # unbuildable from a binary cache: the two patches below are the only
+    # difference from a stock nixpkgs 6.1, and neither cache.nixos.org nor
+    # nix-community.cachix.org has the result, so every machine that builds
+    # this image has to compile a kernel first.
+    #
+    # `useGenericKernel` trades that for ballooning. The balloon patch adds
+    # mem_relinquish, which is how the guest hands free pages back to Android
+    # when the host is short; without it `auto_memory_balloon` is inert and
+    # the VM only ever grows. For a small, steady guest that is fine. For a
+    # machine that rebuilds a NixOS system inside the VM it is not.
     boot.kernelPackages = mkIf (!cfg.useGenericKernel) pkgs.linuxPackages_6_1;
 
     boot.kernelPatches = mkIf (!cfg.useGenericKernel) [
@@ -320,7 +425,13 @@ with lib;
       "console=${serialDevice}"
     ];
 
-    boot.kernelModules = [ "vhost_vsock" ] ++ lib.optionals cfg.enableGraphics [ "virtio_gpu" ];
+    boot.kernelModules = [
+      "vhost_vsock"
+    ]
+    ++ lib.optionals cfg.enableGraphics [ "virtio_gpu" ]
+    # The AVF balloon patch builds `snd_virtio` as a module, so nothing
+    # binds it unless something loads it.
+    ++ lib.optionals cfg.enableAudio [ "snd_virtio" ];
 
     fileSystems = {
       "/" = {
@@ -333,7 +444,12 @@ with lib;
         fsType = "vfat";
       };
 
-      "/mnt/internal" = {
+      # Android 17 stopped exposing /mnt/internal (the app's own data
+      # directory, shared in as virtiofs), so there is nothing to mount and a
+      # virtiofs mount unit for it would fail and take `local-fs.target` with
+      # it. Everything that used to live there -- the Terminal app's CA, the
+      # guest daemons' --grpc-port-file -- went with it.
+      "/mnt/internal" = mkIf (!cfg.directBoot) {
         device = "internal";
         fsType = "virtiofs";
       };
@@ -350,22 +466,40 @@ with lib;
     };
 
     # from Virtualization/guest/storage_balloon_agent/debian/service
+    #
+    # All three of these are inert under direct boot, and not only because
+    # /mnt/internal is gone:
+    #
+    #   * they are told which port to talk to with `--grpc-port-file
+    #     /mnt/internal/debian_service_port`;
+    #   * Android 17 consolidated all three into `linux_vm_manager`, which is
+    #     built with Soong rather than Cargo, so there is no Rust crate left
+    #     for mkRustPkg to build even though the other three are still Cargo
+    #     in the tree.
+    #
+    # The cost is that the app can no longer power the guest off, forward
+    # ports, or reclaim memory through the balloon agent, and there is no
+    # guest agent for the port-notification UI. `poweroff` from inside is the
+    # supported way to stop the VM.
 
-    systemd.services.storage_balloon_agent = mkService "storage_balloon_agent";
+    systemd.services.storage_balloon_agent = mkIf (!cfg.directBoot) (mkService "storage_balloon_agent");
 
     # from Virtualization/guest/forwarder_guest_launcher/debian/service
 
-    systemd.services.forwarder_guest_launcher = mkService "forwarder_guest_launcher" // {
-      path = [
-        extraPkgs.android_virt.forwarder_guest
-        pkgs.bcc
-        "/run/current-system/sw"
-      ];
-    };
+    systemd.services.forwarder_guest_launcher = mkIf (!cfg.directBoot) (
+      mkService "forwarder_guest_launcher"
+      // {
+        path = [
+          extraPkgs.android_virt.forwarder_guest
+          pkgs.bcc
+          "/run/current-system/sw"
+        ];
+      }
+    );
 
     # from Virtualization/guest/shutdown_runner/debian/service
 
-    systemd.services.shutdown_runner = mkService "shutdown_runner";
+    systemd.services.shutdown_runner = mkIf (!cfg.directBoot) (mkService "shutdown_runner");
 
     services.zram-generator = {
       enable = true;
