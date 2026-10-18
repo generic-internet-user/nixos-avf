@@ -75,7 +75,7 @@ with lib;
       };
 
       enableConfigReplace = mkEnableOption "vm_config.json replace (WARNING ALPHA MAY BRICK INSTALL)";
-      useGenericKernel = mkEnableOption "use latest standard kernel (see below for the trade-off)";
+      useGenericKernel = mkEnableOption "use nixpkgs' own kernel instead of the AVF-patched 6.1 (see below; on Android 17 this is the only option that builds)";
       enableGraphics = mkEnableOption "graphics support (Weston + gfxstream)" // {
         default = true;
       };
@@ -365,17 +365,52 @@ with lib;
 
     # avf patches only available for 6.1 right now
     #
-    # Turning these on is what pins the kernel to 6.1 *and* makes it
-    # unbuildable from a binary cache: the two patches below are the only
-    # difference from a stock nixpkgs 6.1, and neither cache.nixos.org nor
-    # nix-community.cachix.org has the result, so every machine that builds
-    # this image has to compile a kernel first.
+    # WARNING: as of nixpkgs 26.05 these patches no longer apply, so leaving
+    # useGenericKernel off makes the kernel *fail to build* rather than merely
+    # be uncached. `arm64-balloon.patch` is a six-patch series and its last
+    # sub-patch fails:
     #
-    # `useGenericKernel` trades that for ballooning. The balloon patch adds
-    # mem_relinquish, which is how the guest hands free pages back to Android
-    # when the host is short; without it `auto_memory_balloon` is inert and
-    # the VM only ever grows. For a small, steady guest that is fine. For a
-    # machine that rebuilds a NixOS system inside the VM it is not.
+    #   Reversed (or previously applied) patch detected!  Assume -R? [n]
+    #   1 out of 1 hunk ignored -- saving rejects to file
+    #   drivers/virtio/virtio_balloon.c.rej
+    #
+    # That sub-patch only deletes the line
+    # `__virtio_clear_bit(vdev, VIRTIO_F_ACCESS_PLATFORM);` from
+    # virtballoon_validate, and its context was invalidated by the upstream
+    # commit that added `__virtio_clear_bit(vdev,
+    # VIRTIO_RING_F_INDIRECT_DESC);` immediately above it ("Disable indirect
+    # descriptors to avoid memory allocation in virtqueue_add during page
+    # reporting"). The AOSP series is still being carried against an older
+    # 6.1. `patchFlags = [ "-N" ]` would silence it, since patch(1) reads the
+    # unmatchable hunk as already applied; that is deliberately not done here
+    # because it also hides real breakage in the other five sub-patches, and
+    # because the line it wants gone is still present -- so `-N` would leave
+    # the kernel disabling VIOMMU for the balloon device, which is the one
+    # thing the sub-patch exists to undo.
+    #
+    # What the patches would buy, on an Android 17 host, is close to nothing:
+    #
+    #   * The balloon patch adds mem_relinquish, which is how a guest hands
+    #     free pages back to Android. But Android 17 folded
+    #     storage_balloon_agent into linux_vm_manager, which is Soong and so
+    #     unbuildable from Nix -- see the directBoot block above. Without the
+    #     host-side agent there is nothing asking for pages to be
+    #     relinquished, so `auto_memory_balloon` is inert either way and the
+    #     guest driver changes nothing.
+    #   * The cpufreq patch only makes the guest observe the host's CPU
+    #     frequencies, which is cosmetic.
+    #
+    # Dropping them also makes the kernel substitutable: a stock nixpkgs
+    # 6.1 (and the 6.18 that `useGenericKernel` actually resolves to on
+    # 26.05) is in cache.nixos.org, whereas neither cache.nixos.org nor
+    # nix-community.cachix.org has the patched one. So the patched path means
+    # compiling a kernel on whatever machine builds the image, for a
+    # capability that is already gone.
+    #
+    # Android's own AVF guest kernels are prebuilt for 6.1, 6.12 and 6.18
+    # (`kernel/prebuilts/common-modules/virtual-device/` in the platform
+    # manifest), so the newer default is a version the hypervisor is known
+    # to work with.
     boot.kernelPackages = mkIf (!cfg.useGenericKernel) pkgs.linuxPackages_6_1;
 
     boot.kernelPatches = mkIf (!cfg.useGenericKernel) [
