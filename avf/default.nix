@@ -211,11 +211,27 @@ with lib;
       };
     */
 
-    systemd.package = pkgs.systemd.overrideAttrs (a: {
-      patches = a.patches ++ [
-        ./systemd-esp-type-ignore.patch
-      ];
-    });
+    # Lets systemd tolerate a partition whose GPT type is not SD_GPT_ESP.
+    #
+    # Only needed on the Android 16 path, where the guest boots through
+    # u-boot and systemd has to find the ESP in the disk crosvm hands it.
+    # Under direct boot nothing on the device ever calls into find-esp: the
+    # kernel and initrd are handed straight to crosvm and `/boot` is an
+    # ordinary fstab entry.
+    #
+    # It also is not free. A patched derivation is in no binary cache, and
+    # this one is used twice -- the toplevel and, because the initrd is a
+    # systemd initrd, the initrd's systemd as well -- so every machine that
+    # builds an Android 17 image compiles a systemd that cache.nixos.org
+    # already has an unpatched copy of. Dropping it here is what makes
+    # systemd substitutable again.
+    systemd.package = mkIf (!cfg.directBoot) (
+      pkgs.systemd.overrideAttrs (a: {
+        patches = a.patches ++ [
+          ./systemd-esp-type-ignore.patch
+        ];
+      })
+    );
 
     systemd.services.ttyd = {
       serviceConfig = {
@@ -565,7 +581,12 @@ with lib;
     users.groups.${cfg.defaultUser} = { };
     security.sudo.wheelNeedsPassword = false;
 
-    programs.bcc.enable = true;
+    # Only ever reached from forwarder_guest_launcher's `path`, which is gated on
+    # !directBoot. Under direct boot this is bcc plus its LLVM stack
+    # installed into the guest for nothing -- substitutable, so no build
+    # cost, but a large slice of a root filesystem that has 4 GiB to work
+    # with.
+    programs.bcc.enable = mkIf (!cfg.directBoot) true;
 
     /*
       programs.bash.interactiveShellInit = ''

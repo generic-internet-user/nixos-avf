@@ -45,6 +45,14 @@ let
     );
 in
 {
+  # Kept patched even though it makes ttyd unbuildable from a binary cache,
+  # because ttyd is how a first boot is reached: the Terminal app finds
+  # it over mDNS and connects to https://<vm>:7681. That is worth one
+  # small local build. `xtermjs_a11y.patch` is an accessibility fix to the
+  # bundled xterm.js, and the client_cert patch below has been inoperative
+  # since libwebsockets 4.3.6 stopped needing the `--ssl-ca` bitmask fix
+  # -- it only matters on the !directBoot path, where /mnt/internal
+  # provides the CA.
   ttyd =
     (ttyd.override {
       libwebsockets = libwebsockets.overrideAttrs (
